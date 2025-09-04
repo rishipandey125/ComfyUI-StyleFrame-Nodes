@@ -14,6 +14,8 @@ import torch
 
 from PIL import Image
 
+# Collection of helper nodes for building comfy workflows that power styleframe ai
+
 def convert_tensor_to_numpy(tensor):
     """ Convert tensor to numpy array and scale it properly for image processing. """
     return (tensor.detach().cpu().numpy() * 255).astype(np.uint8)
@@ -118,7 +120,9 @@ class ResizeFrame:
             "required": {
                 "frame_width": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame width"}),
                 "frame_height": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame height"}),
-                "resolution": ("INT", {"default": 768, "min": 1, "tooltip": "Maximum resolution (width * height <= resolution²)"}),
+                "target_p": ("INT", {"default": 1080, "min": 16, "tooltip": "Target short side in pixels (e.g., 720, 1080)"}),
+                "allow_upscale": ("BOOLEAN", {"default": False, "tooltip": "If enabled, scale up to reach target p"}),
+                "rounding": ((["nearest", "floor", "ceil"]), {"default": "nearest", "tooltip": "How to choose the 16-multiple step near target p"}),
             },
         }
 
@@ -127,38 +131,111 @@ class ResizeFrame:
     FUNCTION = "resize_frame"
     CATEGORY = "Image Processing"
 
-    def resize_frame(self, frame_width, frame_height, resolution):
-        # Calculate maximum allowed pixels
-        max_pixels = resolution * resolution
-        
-        # Calculate aspect ratio
-        aspect_ratio = frame_width / frame_height
-        
-        # Calculate initial dimensions based on aspect ratio
-        if frame_width >= frame_height:
-            # Start with width
-            new_width = frame_width
-            new_height = int(new_width / aspect_ratio)
+    def resize_frame(self, frame_width, frame_height, target_p, allow_upscale, rounding):
+        # Reduce aspect ratio to the simplest integer ratio a:b
+        gcd = math.gcd(frame_width, frame_height)
+        a = frame_width // gcd
+        b = frame_height // gcd
+
+        # Step size for the shorter side in pixels when preserving AR and using multiples of 16
+        short_unit = 16 * min(a, b)
+        width_unit = 16 * a
+        height_unit = 16 * b
+
+        # Helper to clamp at least 1
+        def at_least_one(x):
+            return max(1, x)
+
+        def quantize_to_16(value, mode):
+            if mode == "floor":
+                return (int(value) // 16) * 16
+            elif mode == "ceil":
+                return ((int(value) + 15) // 16) * 16
+            else:  # nearest
+                lower = (int(value) // 16) * 16
+                upper = lower + 16
+                if abs(value - lower) <= abs(upper - value):
+                    return lower
+                else:
+                    return upper
+
+        # Determine t that best matches target_p for the shorter side
+        # Compute target t by rounding rule
+        ideal_t = target_p / short_unit
+        if rounding == "floor":
+            t_candidate = math.floor(ideal_t)
+        elif rounding == "ceil":
+            t_candidate = math.ceil(ideal_t)
+        else:  # "nearest"
+            t_floor = math.floor(ideal_t)
+            t_ceil = math.ceil(ideal_t)
+            # Prefer the one closer to ideal; on tie prefer down to avoid surprise upscale
+            if abs(ideal_t - t_floor) <= abs(t_ceil - ideal_t):
+                t_candidate = t_floor
+            else:
+                t_candidate = t_ceil
+
+        # Ensure minimum t of 1 to keep 16-multiple validity
+        t_candidate = at_least_one(t_candidate)
+
+        # Respect downscale-only by clamping to not exceed original dims when allow_upscale is False
+        if not allow_upscale:
+            # max t that does not exceed original dimensions
+            t_max_by_original_w = frame_width // width_unit if width_unit > 0 else 0
+            t_max_by_original_h = frame_height // height_unit if height_unit > 0 else 0
+            t_max_by_original = min(t_max_by_original_w, t_max_by_original_h)
+            if t_max_by_original <= 0:
+                # If original is smaller than the minimal 16-multiple, fallback to t=1 (minimum valid size)
+                t = 1
+            else:
+                # If nearest picks a value above original, clamp down
+                t = min(t_candidate, t_max_by_original)
         else:
-            # Start with height
-            new_height = frame_height
-            new_width = int(new_height * aspect_ratio)
-        
-        # If the initial dimensions exceed max_pixels, scale down proportionally
-        if new_width * new_height > max_pixels:
-            scale = math.sqrt(max_pixels / (new_width * new_height))
-            new_width = int(new_width * scale)
-            new_height = int(new_height * scale)
-        
-        # Ensure dimensions are multiples of 16
-        new_width = (new_width // 16) * 16
-        new_height = (new_height // 16) * 16
-        
-        # Ensure we don't end up with zero dimensions
+            t = t_candidate
+
+        # Compute final dimensions preserving exact AR and multiples of 16
+        new_width = width_unit * t
+        new_height = height_unit * t
+
+        # Fallback: if we couldn't reduce size under exact-AR constraint (common when gcd is 16)
+        # and downscale-only is requested, approximate AR to hit target_p on the shorter side.
+        # Condition: target short side smaller than the exact-AR minimum short_unit*t (here t>=1)
+        exact_short = min(new_width, new_height)
+        target_p_down = max(16, (target_p // 16) * 16)
+        if not allow_upscale and target_p_down < exact_short:
+            # Scale factor based on the shorter side
+            shorter_side = min(frame_width, frame_height)
+            scale = target_p / max(1, shorter_side)
+            scale = min(1.0, scale)  # downscale-only
+
+            scaled_w = frame_width * scale
+            scaled_h = frame_height * scale
+
+            q_w = quantize_to_16(scaled_w, rounding)
+            q_h = quantize_to_16(scaled_h, rounding)
+
+            # Ensure shorter side does not exceed target_p when downscaling
+            if min(q_w, q_h) > target_p_down:
+                if q_w <= q_h:
+                    q_w = min(q_w, target_p_down)
+                    q_w = (q_w // 16) * 16
+                else:
+                    q_h = min(q_h, target_p_down)
+                    q_h = (q_h // 16) * 16
+
+            # Ensure we did not exceed original dimensions in downscale-only mode
+            q_w = min(q_w, frame_width)
+            q_h = min(q_h, frame_height)
+
+            # Apply minimum bound
+            new_width = max(16, q_w)
+            new_height = max(16, q_h)
+
+        # Ensure we don't end up with zero or negative dimensions
         new_width = max(16, new_width)
         new_height = max(16, new_height)
-        
-        return (new_width, new_height)
+
+        return (int(new_width), int(new_height))
 
 
 class ThresholdImage:
