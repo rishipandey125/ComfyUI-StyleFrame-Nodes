@@ -285,7 +285,7 @@ class SlotFrame:
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
             "empty_frame_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "White level of empty frame to use"}),
             "slot_image": ("IMAGE", {"tooltip": "Image to place in the specified slot"}),
-            "slot_index": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Index where to place the slot image"}),
+            "slot_indices": ("STRING", {"default": "0", "multiline": False, "tooltip": "Comma-separated indices (e.g., 0,3,56) where to place the slot images"}),
             },
             "optional": {
                 "control_images": ("IMAGE",),
@@ -297,9 +297,9 @@ class SlotFrame:
     RETURN_NAMES = ("images", "masks",)
     FUNCTION = "process"
     CATEGORY = "Image Processing"
-    DESCRIPTION = "Places a single image at a specified index in a sequence of frames"
+    DESCRIPTION = "Places one or more images at specified indices in a sequence of frames"
 
-    def process(self, num_frames, empty_frame_level, slot_image, slot_index, control_images=None, inpaint_mask=None):
+    def process(self, num_frames, empty_frame_level, slot_image, slot_indices, control_images=None, inpaint_mask=None):
         B, H, W, C = slot_image.shape
         device = slot_image.device
 
@@ -313,15 +313,43 @@ class SlotFrame:
             empty_frames = torch.ones((num_frames, H, W, 3), device=device) * empty_frame_level
         else:
             empty_frames = control_images[:num_frames]
-        
-        # Ensure slot_index is within bounds
-        slot_index = min(slot_index, num_frames - 1)
-        
-        # Replace the frame at slot_index with slot_image
-        empty_frames[slot_index:slot_index + slot_image.shape[0]] = slot_image
-        
-        # Create mask for the slot image
-        masks[slot_index:slot_index + slot_image.shape[0]] = 0
+
+        # Parse indices from string
+        indices_list = []
+        if isinstance(slot_indices, str):
+            # Support commas or semicolons as separators
+            for token in slot_indices.replace(";", ",").split(","):
+                t = token.strip()
+                if t == "":
+                    continue
+                try:
+                    idx = int(t)
+                except ValueError:
+                    continue
+                # Clamp to valid range
+                if num_frames > 0:
+                    idx = max(0, min(num_frames - 1, idx))
+                indices_list.append(idx)
+
+        if len(indices_list) == 0:
+            indices_list = [0]
+
+        # Place images at specified indices
+        if B == len(indices_list):
+            for i, idx in enumerate(indices_list):
+                empty_frames[idx] = slot_image[i]
+                masks[idx] = 0
+        elif B == 1:
+            for idx in indices_list:
+                empty_frames[idx] = slot_image[0]
+                masks[idx] = 0
+        else:
+            # Map by position up to the shortest length
+            limit = min(B, len(indices_list))
+            for i in range(limit):
+                idx = indices_list[i]
+                empty_frames[idx] = slot_image[i]
+                masks[idx] = 0
 
         if inpaint_mask is not None:
             inpaint_mask = common_upscale(inpaint_mask.unsqueeze(1), W, H, "nearest-exact", "disabled").squeeze(1).to(device)
@@ -330,7 +358,7 @@ class SlotFrame:
             elif inpaint_mask.shape[0] < num_frames:
                 inpaint_mask = inpaint_mask.repeat(num_frames // inpaint_mask.shape[0] + 1, 1, 1)[:num_frames]
 
-            empty_mask = torch.ones_like(masks, device=device)
-            masks = inpaint_mask * empty_mask
+            # Combine existing mask (zeros at placed indices) with provided inpaint mask
+            masks = masks * inpaint_mask
     
         return (empty_frames.cpu().float(), masks.cpu().float())
