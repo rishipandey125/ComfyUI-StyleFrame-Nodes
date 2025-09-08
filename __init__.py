@@ -15,6 +15,7 @@ NODE_CLASS_MAPPINGS = {
     "Get Image Dimensions": GetImageDimensions,
     "Slot Frame": SlotFrame,
     "Batch Keyframes": BatchKeyframes,
+    "Select Image From Batch": SelectImageFromBatch,
 }
 
 

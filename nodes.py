@@ -362,3 +362,37 @@ class SlotFrame:
             masks = masks * inpaint_mask
     
         return (empty_frames.cpu().float(), masks.cpu().float())
+
+
+class SelectImageFromBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Input image batch"}),
+                "index": ("INT", {"default": -1, "min": -999999, "tooltip": "Index in batch (supports negative like -1 for last)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "select_index"
+    CATEGORY = "Image Processing"
+
+    def select_index(self, images, index):
+        # images: [batch, height, width, channels]
+        batch_size = images.shape[0]
+        if batch_size == 0:
+            # Nothing to select; return as-is
+            return (images,)
+
+        # Normalize negative indices
+        if index < 0:
+            index = batch_size + index
+
+        # Clamp to valid range
+        index = max(0, min(batch_size - 1, int(index)))
+
+        # Keep batch dimension
+        selected = images[index:index+1]
+        return (selected,)
