@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import math 
 import torch 
+import json
 
 from PIL import Image
 
@@ -24,6 +25,96 @@ def convert_tensor_to_numpy(tensor):
 def convert_numpy_to_tensor(numpy_image):
     """ Convert processed numpy image back to tensor and normalize it. """
     return torch.from_numpy(numpy_image).float() / 255
+
+
+def run_canny_on_pil(pil_image: Image.Image, low_threshold: int, high_threshold: int) -> Image.Image:
+    # OpenCV Canny implementation only (no controlnet_aux dependency)
+    rgb = pil_image.convert("RGB")
+    arr = np.array(rgb)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    return Image.fromarray(edges).convert("RGB")
+
+
+class LoadImageFolder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_folder": ("STRING", {"default": "", "tooltip": "Folder containing input images"}),
+                "extensions": ("STRING", {"default": "png,jpg,jpeg,webp", "tooltip": "Comma-separated extensions or 'all'"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "filenames", "sizes")
+    FUNCTION = "load_folder"
+    CATEGORY = "Image Processing/IO"
+
+    def _list_images(self, folder_path: str, extensions: list) -> list:
+        files = []
+        try:
+            for name in os.listdir(folder_path):
+                p = os.path.join(folder_path, name)
+                if not os.path.isfile(p):
+                    continue
+                ext = os.path.splitext(name)[1].lower().lstrip(".")
+                if len(extensions) == 0 or ext in extensions:
+                    files.append(p)
+        except FileNotFoundError:
+            return []
+        files.sort()
+        return files
+
+    def load_folder(self, input_folder: str, extensions: str):
+        input_folder = os.path.expandvars(os.path.expanduser(input_folder)).strip().strip('"').strip("'")
+        ext_list = [e.strip().lower().lstrip('.') for e in extensions.split(',') if e.strip() != ""]
+        if len(ext_list) == 0 or "*" in ext_list or "all" in ext_list:
+            ext_list = ["png", "jpg", "jpeg", "webp"]
+
+        paths = self._list_images(input_folder, ext_list)
+        if len(paths) == 0:
+            # Return empty batch
+            empty = torch.zeros((0, 1, 1, 3), dtype=torch.float32)
+            return (empty, json.dumps([]), json.dumps([]))
+
+        images = []
+        names = []
+        sizes = []
+        max_w = 0
+        max_h = 0
+        for p in paths:
+            try:
+                img = Image.open(p).convert("RGB")
+                arr = np.array(img).astype(np.float32) / 255.0
+                h, w = arr.shape[0], arr.shape[1]
+                sizes.append([w, h])
+                if w > max_w:
+                    max_w = w
+                if h > max_h:
+                    max_h = h
+                images.append(arr)
+                names.append(os.path.basename(p))
+            except Exception:
+                continue
+
+        if len(images) == 0:
+            empty = torch.zeros((0, 1, 1, 3), dtype=torch.float32)
+            return (empty, json.dumps([]), json.dumps([]))
+
+        # Pad images to (max_h, max_w)
+        padded_tensors = []
+        for arr in images:
+            h, w = arr.shape[0], arr.shape[1]
+            if h == max_h and w == max_w:
+                padded = arr
+            else:
+                padded = np.zeros((max_h, max_w, 3), dtype=np.float32)
+                padded[:h, :w, :] = arr
+            padded_tensors.append(torch.from_numpy(padded))
+
+        batch = torch.stack(padded_tensors, dim=0)
+        return (batch, json.dumps(names), json.dumps(sizes))
 
 
 class BatchKeyframes:
@@ -396,3 +487,113 @@ class SelectImageFromBatch:
         # Keep batch dimension
         selected = images[index:index+1]
         return (selected,)
+
+
+class CannyEdge:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Input image or batch"}),
+                "low_threshold": ("INT", {"default": 100, "min": 0, "max": 255}),
+                "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("edges",)
+    FUNCTION = "execute"
+    CATEGORY = "Image Processing/Filters"
+
+    def execute(self, images, low_threshold: int, high_threshold: int):
+        # images [B,H,W,C] in 0..1 float
+        low_threshold = int(max(0, min(255, low_threshold)))
+        high_threshold = int(max(0, min(255, high_threshold)))
+        if high_threshold < low_threshold:
+            low_threshold, high_threshold = high_threshold, low_threshold
+
+        batch, height, width, channels = images.shape
+        device = images.device
+        output = []
+        for i in range(batch):
+            pil_in = Image.fromarray((images[i].cpu().numpy() * 255).astype(np.uint8))
+            pil_out = run_canny_on_pil(pil_in, low_threshold, high_threshold)
+            arr = np.array(pil_out).astype(np.float32) / 255.0
+            if arr.ndim == 2:
+                arr = np.stack([arr, arr, arr], axis=-1)
+            # Ensure original resolution is preserved explicitly
+            if arr.shape[0] != height or arr.shape[1] != width:
+                arr = cv2.resize(arr, (width, height), interpolation=cv2.INTER_NEAREST)
+            output.append(torch.from_numpy(arr))
+        result = torch.stack(output, dim=0).to(device)
+        return (result,)
+
+
+
+class SaveImageFolder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Image batch to save"}),
+                "output_folder": ("STRING", {"default": "", "tooltip": "Folder to save images"}),
+                "format": ("STRING", {"default": "png", "tooltip": "png|jpg|webp"}),
+            },
+            "optional": {
+                "filenames": ("STRING", {"default": "[]", "tooltip": "Optional JSON array of filenames to use directly"}),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("saved_count", "output_folder")
+    FUNCTION = "save_folder"
+    CATEGORY = "Image Processing/IO"
+
+    def save_folder(self, images, output_folder: str, format: str, filenames: str = "[]"):
+        output_folder = os.path.expandvars(os.path.expanduser(output_folder)).strip().strip('"').strip("'")
+        os.makedirs(output_folder, exist_ok=True)
+
+        try:
+            name_list = json.loads(filenames)
+            if not isinstance(name_list, list):
+                name_list = []
+        except Exception:
+            name_list = []
+
+        ext = format.lower().strip('.').strip()
+        if ext not in ["png", "jpg", "jpeg", "webp"]:
+            ext = "png"
+
+        count = images.shape[0]
+        saved = 0
+        pbar = ProgressBar(count)
+        for i in range(count):
+            try:
+                if i < len(name_list) and isinstance(name_list[i], str) and name_list[i].strip() != "":
+                    candidate = os.path.basename(name_list[i].strip())
+                    base, ext_existing = os.path.splitext(candidate)
+                    if ext_existing == "":
+                        out_filename = f"{candidate}.{ext}"
+                    else:
+                        out_filename = candidate  # keep provided extension
+                else:
+                    out_filename = f"output_{i}.{ext}"
+
+                out_path = os.path.join(output_folder, out_filename)
+
+                arr = (images[i].cpu().numpy() * 255).clip(0,255).astype(np.uint8)
+                pil = Image.fromarray(arr)
+                params = {}
+                out_ext = os.path.splitext(out_path)[1].lower()
+                if out_ext in [".jpg", ".jpeg"]:
+                    if pil.mode != "RGB":
+                        pil = pil.convert("RGB")
+                    params["quality"] = 95
+                pil.save(out_path, **params)
+                saved += 1
+            except Exception:
+                pass
+            finally:
+                pbar.update(1)
+
+        return (saved, output_folder)

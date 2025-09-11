@@ -16,6 +16,9 @@ NODE_CLASS_MAPPINGS = {
     "Slot Frame": SlotFrame,
     "Batch Keyframes": BatchKeyframes,
     "Select Image From Batch": SelectImageFromBatch,
+    "Canny Edge": CannyEdge,
+    "Load Image Folder": LoadImageFolder,
+    "Save Image Folder": SaveImageFolder,
 }
 
 
