@@ -597,3 +597,57 @@ class SaveImageFolder:
                 pbar.update(1)
 
         return (saved, output_folder)
+
+
+
+class StringToFloatList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "numbers": ("STRING", {"default": "3,4.3,5", "tooltip": "Comma-separated numbers or JSON list, e.g., 1,2.5,3 or [1,2.5,3]"}),
+            },
+        }
+
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("float_list",)
+    FUNCTION = "parse"
+    CATEGORY = "Utilities/Parsing"
+
+    def parse(self, numbers: str):
+        # Try JSON first
+        parsed: list = []
+        try:
+            obj = json.loads(numbers)
+            if isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (int, float)):
+                        parsed.append(float(item))
+                    elif isinstance(item, str) and item.strip() != "":
+                        try:
+                            parsed.append(float(item.strip()))
+                        except Exception:
+                            continue
+                return (parsed,)
+        except Exception:
+            pass
+
+        # Fallback: flexible delimiter parsing
+        s = numbers.strip()
+        # Normalize brackets and separators
+        for ch in "[](){}":
+            s = s.replace(ch, "")
+        s = s.replace(";", ",")
+        # If there are no commas, split on whitespace
+        tokens = [t for t in s.split(",")] if "," in s else s.split()
+        for token in tokens:
+            t = token.strip()
+            if t == "":
+                continue
+            try:
+                parsed.append(float(t))
+            except Exception:
+                # Skip non-numeric tokens
+                continue
+
+        return (parsed,)
