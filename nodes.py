@@ -598,6 +598,49 @@ class SaveImageFolder:
 
         return (saved, output_folder)
 
+class ThresholdImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Input edge maps to binarize"}),
+                "threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Threshold from 0.0 to 1.0 — pixels below are black, above are white"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("binarized_images",)
+    FUNCTION = "threshold_images"
+    CATEGORY = "Image Processing"
+
+    def threshold_images(self, images, threshold):
+        images_np = convert_tensor_to_numpy(images)  # shape: [B, H, W, 3], dtype: uint8 or float32
+
+        binarized_images = []
+        threshold_255 = threshold * 255.0
+
+        for image in images_np:
+            # If image is in float [0, 1], scale it to [0, 255]
+            if image.dtype == np.float32 and image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+
+            # Grayscale using luminosity method
+            grayscale = (0.2989 * image[..., 0] + 0.5870 * image[..., 1] + 0.1140 * image[..., 2])
+
+            # Apply threshold
+            binary = (grayscale >= threshold_255).astype(np.uint8) * 255
+
+            # Convert back to RGB
+            binarized_rgb = np.stack([binary]*3, axis=-1).astype(np.uint8)
+            binarized_images.append(binarized_rgb)
+
+        binarized_np = np.stack(binarized_images, axis=0)
+        binarized_tensor = convert_numpy_to_tensor(binarized_np)
+
+        return (binarized_tensor,)
 
 
 class StringToFloatList:

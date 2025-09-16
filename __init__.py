@@ -9,6 +9,7 @@ from .nodes import *
 #Unpack Frames
 
 NODE_CLASS_MAPPINGS = {
+    "Threshold Image": ThresholdImage,
     "Resize Frame": ResizeFrame,
     "Pad Batch to 4n+1": PadBatchTo4nPlus1,
     "Trim Padded Batch": TrimPaddedBatch,
@@ -20,6 +21,7 @@ NODE_CLASS_MAPPINGS = {
     "Load Image Folder": LoadImageFolder,
     "Save Image Folder": SaveImageFolder,
     "String To Float List": StringToFloatList,
+
 }
 
 
