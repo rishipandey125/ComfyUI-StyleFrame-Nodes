@@ -14,7 +14,7 @@ import math
 import torch 
 import json
 
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence
 
 # Collection of helper nodes for building comfy workflows that power styleframe ai
 
@@ -35,6 +35,93 @@ def run_canny_on_pil(pil_image: Image.Image, low_threshold: int, high_threshold:
     edges = cv2.Canny(gray, low_threshold, high_threshold)
     return Image.fromarray(edges).convert("RGB")
 
+
+class LoadImages:
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        files = folder_paths.filter_files_content_types(files, ["image"])
+        files = sorted(files)
+        # Provide up to 10 selectable image inputs
+        required = {
+            "image_1": (files, {"image_upload": True}),
+        }
+        optional = {}
+        for i in range(2, 11):
+            optional[f"image_{i}"] = (files, {"image_upload": True})
+        return {"required": required, "optional": optional}
+
+    CATEGORY = "image"
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "masks")
+    FUNCTION = "load_images"
+
+    def _load_single(self, image_name, ref_size):
+        image_path = folder_paths.get_annotated_filepath(image_name)
+        img = node_helpers.pillow(Image.open, image_path)
+
+        output_images = []
+        output_masks = []
+        w, h = ref_size if ref_size is not None else (None, None)
+
+        for frame in ImageSequence.Iterator(img):
+            frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
+
+            if frame.mode == 'I':
+                frame = frame.point(lambda x: x * (1 / 255))
+            rgb = frame.convert("RGB")
+
+            if w is None and h is None:
+                w, h = rgb.size[0], rgb.size[1]
+
+            if rgb.size[0] != w or rgb.size[1] != h:
+                # Skip frames that do not match reference size
+                continue
+
+            np_img = np.array(rgb).astype(np.float32) / 255.0
+            tensor_img = torch.from_numpy(np_img)[None,]
+
+            # Derive mask from alpha channel when present; otherwise default 64x64 zeros (ComfyUI convention)
+            if 'A' in frame.getbands():
+                mask_arr = np.array(frame.getchannel('A')).astype(np.float32) / 255.0
+                mask_tensor = 1. - torch.from_numpy(mask_arr)
+            elif frame.mode == 'P' and 'transparency' in frame.info:
+                mask_arr = np.array(frame.convert('RGBA').getchannel('A')).astype(np.float32) / 255.0
+                mask_tensor = 1. - torch.from_numpy(mask_arr)
+            else:
+                mask_tensor = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+
+            output_images.append(tensor_img)
+            output_masks.append(mask_tensor.unsqueeze(0))
+
+        return output_images, output_masks, (w, h)
+
+    def load_images(self, image_1, image_2=None, image_3=None, image_4=None, image_5=None,
+                    image_6=None, image_7=None, image_8=None, image_9=None, image_10=None):
+        names = [n for n in [image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9, image_10] if n is not None]
+        if len(names) == 0:
+            empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (empty_img, empty_mask)
+
+        all_images = []
+        all_masks = []
+        ref_size = None
+
+        for name in names:
+            imgs, masks, ref_size = self._load_single(name, ref_size)
+            all_images.extend(imgs)
+            all_masks.extend(masks)
+
+        if len(all_images) == 0:
+            empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            return (empty_img, empty_mask)
+
+        images_tensor = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
+        masks_tensor = torch.cat(all_masks, dim=0) if len(all_masks) > 1 else all_masks[0]
+        return (images_tensor, masks_tensor)
 
 class LoadImageFolder:
     @classmethod
