@@ -43,27 +43,42 @@ class LoadImages:
         files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
         files = folder_paths.filter_files_content_types(files, ["image"])
         files = sorted(files)
-        # Provide up to 10 selectable image inputs
-        required = {
-            "image_1": (files, {"image_upload": True}),
-        }
-        optional = {}
-        for i in range(2, 11):
-            optional[f"image_{i}"] = (files, {"image_upload": True})
-        return {"required": required, "optional": optional}
+        choices = ["(none)"] + files
+        # Provide up to 10 selectable image inputs; make all required with a '(none)' default
+        required = {}
+        for i in range(1, 11):
+            required[f"image_{i}"] = (choices, {"image_upload": True, "default": "(none)"})
+        # Target resize parameters
+        required["target_width"] = ("INT", {"default": 1024, "min": 1})
+        required["target_height"] = ("INT", {"default": 1024, "min": 1})
+        return {"required": required}
 
     CATEGORY = "image"
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("images", "masks")
     FUNCTION = "load_images"
 
-    def _load_single(self, image_name, ref_size):
+    def _resize_center_crop(self, pil_img: Image.Image, target_w: int, target_h: int, resample=Image.LANCZOS) -> Image.Image:
+        src_w, src_h = pil_img.size
+        if src_w == 0 or src_h == 0:
+            return pil_img
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = pil_img.resize((new_w, new_h), resample)
+        left = max(0, (new_w - target_w) // 2)
+        top = max(0, (new_h - target_h) // 2)
+        right = left + target_w
+        bottom = top + target_h
+        return resized.crop((left, top, right, bottom))
+
+    def _load_single(self, image_name, target_width: int, target_height: int):
         image_path = folder_paths.get_annotated_filepath(image_name)
         img = node_helpers.pillow(Image.open, image_path)
 
         output_images = []
         output_masks = []
-        w, h = ref_size if ref_size is not None else (None, None)
+        w, h = target_width, target_height
 
         for frame in ImageSequence.Iterator(img):
             frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
@@ -71,52 +86,54 @@ class LoadImages:
             if frame.mode == 'I':
                 frame = frame.point(lambda x: x * (1 / 255))
             rgb = frame.convert("RGB")
-
-            if w is None and h is None:
-                w, h = rgb.size[0], rgb.size[1]
-
-            if rgb.size[0] != w or rgb.size[1] != h:
-                # Skip frames that do not match reference size
-                continue
+            if rgb.size != (w, h):
+                rgb = self._resize_center_crop(rgb, w, h, Image.LANCZOS)
 
             np_img = np.array(rgb).astype(np.float32) / 255.0
             tensor_img = torch.from_numpy(np_img)[None,]
 
-            # Derive mask from alpha channel when present; otherwise default 64x64 zeros (ComfyUI convention)
+            # Derive mask from alpha channel when present; otherwise default zero mask at target size
             if 'A' in frame.getbands():
-                mask_arr = np.array(frame.getchannel('A')).astype(np.float32) / 255.0
+                alpha = frame.getchannel('A')
+                if alpha.size != (w, h):
+                    alpha = self._resize_center_crop(alpha, w, h, Image.BILINEAR)
+                mask_arr = np.array(alpha).astype(np.float32) / 255.0
                 mask_tensor = 1. - torch.from_numpy(mask_arr)
             elif frame.mode == 'P' and 'transparency' in frame.info:
-                mask_arr = np.array(frame.convert('RGBA').getchannel('A')).astype(np.float32) / 255.0
+                alpha = frame.convert('RGBA').getchannel('A')
+                if alpha.size != (w, h):
+                    alpha = self._resize_center_crop(alpha, w, h, Image.BILINEAR)
+                mask_arr = np.array(alpha).astype(np.float32) / 255.0
                 mask_tensor = 1. - torch.from_numpy(mask_arr)
             else:
-                mask_tensor = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+                mask_tensor = torch.zeros((h, w), dtype=torch.float32, device="cpu")
 
             output_images.append(tensor_img)
             output_masks.append(mask_tensor.unsqueeze(0))
 
-        return output_images, output_masks, (w, h)
+        return output_images, output_masks
 
-    def load_images(self, image_1, image_2=None, image_3=None, image_4=None, image_5=None,
-                    image_6=None, image_7=None, image_8=None, image_9=None, image_10=None):
-        names = [n for n in [image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9, image_10] if n is not None]
+    def load_images(self, image_1, image_2, image_3, image_4, image_5,
+                    image_6, image_7, image_8, image_9, image_10,
+                    target_width, target_height):
+        raw_names = [image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9, image_10]
+        names = [n for n in raw_names if n is not None and str(n).strip() != "" and str(n).strip() != "(none)"]
         if len(names) == 0:
             empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            empty_mask = torch.zeros((1, target_height, target_width), dtype=torch.float32)
             return (empty_img, empty_mask)
 
         all_images = []
         all_masks = []
-        ref_size = None
 
         for name in names:
-            imgs, masks, ref_size = self._load_single(name, ref_size)
+            imgs, masks = self._load_single(name, int(target_width), int(target_height))
             all_images.extend(imgs)
             all_masks.extend(masks)
 
         if len(all_images) == 0:
             empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-            empty_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
+            empty_mask = torch.zeros((1, target_height, target_width), dtype=torch.float32)
             return (empty_img, empty_mask)
 
         images_tensor = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
