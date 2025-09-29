@@ -20,6 +20,7 @@ NODE_CLASS_MAPPINGS = {
     "Canny Edge": CannyEdge,
     "Load Image Folder": LoadImageFolder,
     "Load Images": LoadImages,
+    "Load Images From List": LoadImagesFromList,
     "Save Image Folder": SaveImageFolder,
     "String To Float List": StringToFloatList,
 

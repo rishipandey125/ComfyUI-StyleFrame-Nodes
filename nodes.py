@@ -140,6 +140,117 @@ class LoadImages:
         masks_tensor = torch.cat(all_masks, dim=0) if len(all_masks) > 1 else all_masks[0]
         return (images_tensor, masks_tensor)
 
+
+class LoadImagesFromList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "filenames": ("STRING", {"default": "[]", "multiline": True, "tooltip": "JSON list or CSV of filenames in input folder or absolute paths"}),
+                "target_width": ("INT", {"default": 1024, "min": 1}),
+                "target_height": ("INT", {"default": 1024, "min": 1}),
+            }
+        }
+
+    CATEGORY = "image"
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "masks")
+    FUNCTION = "load_images_from_list"
+
+    def _parse_list(self, filenames: str) -> List[str]:
+        try:
+            obj = json.loads(filenames)
+            if isinstance(obj, list):
+                return [str(x) for x in obj if isinstance(x, (str, int, float)) and str(x).strip() != ""]
+        except Exception:
+            pass
+        items = []
+        for token in filenames.replace("\n", ",").split(","):
+            t = token.strip().strip('"').strip("'")
+            if t:
+                items.append(t)
+        return items
+
+    def _resolve_path(self, name: str) -> str:
+        candidate = os.path.expandvars(os.path.expanduser(name))
+        if os.path.isfile(candidate):
+            return candidate
+        try:
+            return folder_paths.get_annotated_filepath(name)
+        except Exception:
+            input_dir = folder_paths.get_input_directory()
+            return os.path.join(input_dir, name)
+
+    def _resize_center_crop(self, pil_img: Image.Image, target_w: int, target_h: int, resample=Image.LANCZOS) -> Image.Image:
+        src_w, src_h = pil_img.size
+        if src_w == 0 or src_h == 0:
+            return pil_img
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = pil_img.resize((new_w, new_h), resample)
+        left = max(0, (new_w - target_w) // 2)
+        top = max(0, (new_h - target_h) // 2)
+        right = left + target_w
+        bottom = top + target_h
+        return resized.crop((left, top, right, bottom))
+
+    def load_images_from_list(self, filenames: str, target_width: int, target_height: int):
+        names = self._parse_list(filenames)
+        if len(names) == 0:
+            empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, target_height, target_width), dtype=torch.float32)
+            return (empty_img, empty_mask)
+
+        all_images: List[torch.Tensor] = []
+        all_masks: List[torch.Tensor] = []
+
+        for name in names:
+            try:
+                path = self._resolve_path(name)
+                img = node_helpers.pillow(Image.open, path)
+            except Exception:
+                continue
+
+            for frame in ImageSequence.Iterator(img):
+                try:
+                    frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
+                    rgb = frame.convert("RGB")
+                    if rgb.size != (target_width, target_height):
+                        rgb = self._resize_center_crop(rgb, target_width, target_height, Image.LANCZOS)
+
+                    np_img = np.array(rgb).astype(np.float32) / 255.0
+                    tensor_img = torch.from_numpy(np_img)[None,]
+
+                    if 'A' in frame.getbands():
+                        alpha = frame.getchannel('A')
+                        if alpha.size != (target_width, target_height):
+                            alpha = self._resize_center_crop(alpha, target_width, target_height, Image.BILINEAR)
+                        mask_arr = np.array(alpha).astype(np.float32) / 255.0
+                        mask_tensor = 1. - torch.from_numpy(mask_arr)
+                    elif frame.mode == 'P' and 'transparency' in frame.info:
+                        alpha = frame.convert('RGBA').getchannel('A')
+                        if alpha.size != (target_width, target_height):
+                            alpha = self._resize_center_crop(alpha, target_width, target_height, Image.BILINEAR)
+                        mask_arr = np.array(alpha).astype(np.float32) / 255.0
+                        mask_tensor = 1. - torch.from_numpy(mask_arr)
+                    else:
+                        mask_tensor = torch.zeros((target_height, target_width), dtype=torch.float32, device="cpu")
+
+                    all_images.append(tensor_img)
+                    all_masks.append(mask_tensor.unsqueeze(0))
+                except Exception:
+                    continue
+
+        if len(all_images) == 0:
+            empty_img = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((1, target_height, target_width), dtype=torch.float32)
+            return (empty_img, empty_mask)
+
+        images_tensor = torch.cat(all_images, dim=0) if len(all_images) > 1 else all_images[0]
+        masks_tensor = torch.cat(all_masks, dim=0) if len(all_masks) > 1 else all_masks[0]
+        return (images_tensor, masks_tensor)
+
 class LoadImageFolder:
     @classmethod
     def INPUT_TYPES(cls):
