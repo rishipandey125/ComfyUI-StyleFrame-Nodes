@@ -23,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "Load Images From List": LoadImagesFromList,
     "Save Image Folder": SaveImageFolder,
     "String To Float List": StringToFloatList,
+    "Integer Min/Max": IntMinMax,
 
 }
 

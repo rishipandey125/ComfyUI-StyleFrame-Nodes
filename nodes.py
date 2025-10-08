@@ -909,3 +909,27 @@ class StringToFloatList:
                 continue
 
         return (parsed,)
+
+
+class IntMinMax:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "a": ("INT", {"default": 0}),
+                "b": ("INT", {"default": 0}),
+                "mode": (["min", "max"], {"default": "min"}),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "compute"
+    CATEGORY = "Utilities/Math"
+
+    def compute(self, a: int, b: int, mode: str):
+        a_int = int(a)
+        b_int = int(b)
+        if str(mode).lower() == "max":
+            return (max(a_int, b_int),)
+        return (min(a_int, b_int),)
