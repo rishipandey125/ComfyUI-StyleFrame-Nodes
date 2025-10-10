@@ -933,3 +933,28 @@ class IntMinMax:
         if str(mode).lower() == "max":
             return (max(a_int, b_int),)
         return (min(a_int, b_int),)
+
+
+class ImageGrayscale:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("grayscale_image",)
+    FUNCTION = "convert_to_grayscale"
+    CATEGORY = "Image Processing/Color"
+
+    def convert_to_grayscale(self, image: torch.Tensor):
+        # Image tensor is [B, H, W, C] in 0-1 float
+        # Grayscale conversion formula: 0.2989 * R + 0.5870 * G + 0.1140 * B
+        # This will result in a [B, H, W] tensor, so we need to expand dims to [B, H, W, 3]
+        grayscale_image = 0.2989 * image[..., 0] + 0.5870 * image[..., 1] + 0.1140 * image[..., 2]
+        # Stack the grayscale channel 3 times to create an RGB-like image
+        grayscale_image = grayscale_image.unsqueeze(-1).repeat(1, 1, 1, 3)
+        return (grayscale_image,)
+
