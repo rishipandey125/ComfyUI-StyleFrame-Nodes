@@ -380,9 +380,9 @@ class ResizeFrame:
             "required": {
                 "frame_width": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame width"}),
                 "frame_height": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame height"}),
-                "target_p": ("INT", {"default": 1080, "min": 16, "tooltip": "Target short side in pixels (e.g., 720, 1080)"}),
-                "allow_upscale": ("BOOLEAN", {"default": False, "tooltip": "If enabled, scale up to reach target p"}),
-                "rounding": ((["nearest", "floor", "ceil"]), {"default": "nearest", "tooltip": "How to choose the 16-multiple step near target p"}),
+                "target_p": ("INT", {"default": 1080, "min": 16, "tooltip": "Pixel density side: total pixels ≈ target_p^2; preserves AR; multiples of 16"}),
+                "allow_upscale": ("BOOLEAN", {"default": False, "tooltip": "If enabled, allow exceeding original size to hit target pixel density"}),
+                "rounding": ((["nearest", "floor", "ceil"]), {"default": "nearest", "tooltip": "Quantization mode when rounding to multiples of 16"}),
             },
         }
 
@@ -392,110 +392,67 @@ class ResizeFrame:
     CATEGORY = "Image Processing"
 
     def resize_frame(self, frame_width, frame_height, target_p, allow_upscale, rounding):
-        # Reduce aspect ratio to the simplest integer ratio a:b
-        gcd = math.gcd(frame_width, frame_height)
-        a = frame_width // gcd
-        b = frame_height // gcd
+        # Pixel-density driven sizing:
+        # Given target_p, aim for total pixels ~= target_p^2 while preserving input AR,
+        # and quantize to multiples of 16. Optionally avoid upscaling.
 
-        # Step size for the shorter side in pixels when preserving AR and using multiples of 16
-        short_unit = 16 * min(a, b)
-        width_unit = 16 * a
-        height_unit = 16 * b
+        # Guard invalid inputs
+        fw = int(max(1, frame_width))
+        fh = int(max(1, frame_height))
+        tp = int(max(16, target_p))
 
-        # Helper to clamp at least 1
-        def at_least_one(x):
-            return max(1, x)
-
+        # Helper: quantize any value to a multiple of 16 following the selected mode
         def quantize_to_16(value, mode):
+            v = float(value)
             if mode == "floor":
-                return (int(value) // 16) * 16
+                return max(16, (int(v) // 16) * 16)
             elif mode == "ceil":
-                return ((int(value) + 15) // 16) * 16
+                return max(16, ((int(v) + 15) // 16) * 16)
             else:  # nearest
-                lower = (int(value) // 16) * 16
+                lower = (int(v) // 16) * 16
                 upper = lower + 16
-                if abs(value - lower) <= abs(upper - value):
+                # ensure lower is at least 16
+                lower = max(16, lower)
+                if abs(v - lower) <= abs(upper - v):
                     return lower
                 else:
                     return upper
 
-        # Determine t that best matches target_p for the shorter side
-        # Compute target t by rounding rule
-        ideal_t = target_p / short_unit
-        if rounding == "floor":
-            t_candidate = math.floor(ideal_t)
-        elif rounding == "ceil":
-            t_candidate = math.ceil(ideal_t)
-        else:  # "nearest"
-            t_floor = math.floor(ideal_t)
-            t_ceil = math.ceil(ideal_t)
-            # Prefer the one closer to ideal; on tie prefer down to avoid surprise upscale
-            if abs(ideal_t - t_floor) <= abs(t_ceil - ideal_t):
-                t_candidate = t_floor
-            else:
-                t_candidate = t_ceil
+        # Desired area and aspect ratio
+        area = float(tp) * float(tp)
+        aspect = float(fw) / float(fh)
+        aspect = max(1e-6, aspect)
 
-        # Ensure minimum t of 1 to keep 16-multiple validity
-        t_candidate = at_least_one(t_candidate)
+        # Ideal (real-valued) dimensions that satisfy area and AR exactly
+        # w = sqrt(area * aspect), h = area / w
+        ideal_w = math.sqrt(area * aspect)
+        ideal_h = area / max(1e-6, ideal_w)
 
-        # Respect downscale-only by clamping to not exceed original dims when allow_upscale is False
+        # Respect downscale-only mode by capping to original dimensions prior to quantization
         if not allow_upscale:
-            # max t that does not exceed original dimensions
-            t_max_by_original_w = frame_width // width_unit if width_unit > 0 else 0
-            t_max_by_original_h = frame_height // height_unit if height_unit > 0 else 0
-            t_max_by_original = min(t_max_by_original_w, t_max_by_original_h)
-            if t_max_by_original <= 0:
-                # If original is smaller than the minimal 16-multiple, fallback to t=1 (minimum valid size)
-                t = 1
-            else:
-                # If nearest picks a value above original, clamp down
-                t = min(t_candidate, t_max_by_original)
-        else:
-            t = t_candidate
+            scale_cap = min(1.0, fw / max(1e-6, ideal_w), fh / max(1e-6, ideal_h))
+            ideal_w *= scale_cap
+            ideal_h *= scale_cap
 
-        # Compute final dimensions preserving exact AR and multiples of 16
-        new_width = width_unit * t
-        new_height = height_unit * t
+        q_w = quantize_to_16(ideal_w, rounding)
+        q_h = quantize_to_16(ideal_h, rounding)
 
-        # Fallback: if we couldn't reduce size under exact-AR constraint (common when gcd is 16)
-        # and downscale-only is requested, approximate AR to hit target_p on the shorter side.
-        # Condition: target short side smaller than the exact-AR minimum short_unit*t (here t>=1)
-        exact_short = min(new_width, new_height)
-        target_p_down = max(16, (target_p // 16) * 16)
-        if not allow_upscale and target_p_down < exact_short:
-            # Scale factor based on the shorter side
-            shorter_side = min(frame_width, frame_height)
-            scale = target_p / max(1, shorter_side)
-            scale = min(1.0, scale)  # downscale-only
+        # Ensure we don't exceed original dimensions when upscaling is disabled
+        if not allow_upscale:
+            if q_w > fw:
+                q_w = (fw // 16) * 16 or 16
+            if q_h > fh:
+                q_h = (fh // 16) * 16 or 16
+            # If quantization created imbalance vs AR, try to adjust one side closer by one step
+            if q_w * q_h == 0:
+                q_w = max(16, q_w)
+                q_h = max(16, q_h)
 
-            scaled_w = frame_width * scale
-            scaled_h = frame_height * scale
+        # Final safety minimums
+        new_width = max(16, int(q_w))
+        new_height = max(16, int(q_h))
 
-            q_w = quantize_to_16(scaled_w, rounding)
-            q_h = quantize_to_16(scaled_h, rounding)
-
-            # Ensure shorter side does not exceed target_p when downscaling
-            if min(q_w, q_h) > target_p_down:
-                if q_w <= q_h:
-                    q_w = min(q_w, target_p_down)
-                    q_w = (q_w // 16) * 16
-                else:
-                    q_h = min(q_h, target_p_down)
-                    q_h = (q_h // 16) * 16
-
-            # Ensure we did not exceed original dimensions in downscale-only mode
-            q_w = min(q_w, frame_width)
-            q_h = min(q_h, frame_height)
-
-            # Apply minimum bound
-            new_width = max(16, q_w)
-            new_height = max(16, q_h)
-
-        # Ensure we don't end up with zero or negative dimensions
-        new_width = max(16, new_width)
-        new_height = max(16, new_height)
-
-        return (int(new_width), int(new_height))
+        return (new_width, new_height)
 
 
 class PadBatchTo4nPlus1:
