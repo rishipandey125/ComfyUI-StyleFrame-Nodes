@@ -473,25 +473,22 @@ class PadBatchTo4nPlus1:
         # Get the current batch size
         current_size = images.shape[0]
         
-        # Calculate the next 4n+1 size
-        n = math.ceil((current_size - 1) / 4)
+        # Calculate the next 4n+1 size strictly beyond the current size
+        # Example: 104 -> 109, 105 -> 109
+        n = math.ceil((current_size + 2) / 4)
         target_size = 4 * n + 1
-        
-        # If we're already at a 4n+1 size, return as is
-        if current_size == target_size:
-            return (images, current_size, target_size)
             
         # Calculate how many frames we need to pad
         padding_size = target_size - current_size
         
-        # Get the last frame to repeat
-        last_frame = images[-1]
+        # Get the first frame to repeat
+        first_frame = images[0]
         
-        # Create the padding frames by repeating the last frame
-        padding_frames = last_frame.unsqueeze(0).repeat(padding_size, 1, 1, 1)
+        # Create the padding frames by repeating the first frame
+        padding_frames = first_frame.unsqueeze(0).repeat(padding_size, 1, 1, 1)
         
-        # Concatenate the original frames with the padding frames
-        padded_images = torch.cat([images, padding_frames], dim=0)
+        # Concatenate the padding frames in front of the original frames
+        padded_images = torch.cat([padding_frames, images], dim=0)
         
         return (padded_images, current_size, target_size)
 
@@ -514,8 +511,8 @@ class TrimPaddedBatch:
         # Ensure original_count is not larger than the current batch size
         original_count = min(original_count, images.shape[0])
         
-        # Trim the batch to the original size
-        trimmed_images = images[:original_count]
+        # Keep the last original_count frames (remove the front padding)
+        trimmed_images = images[-original_count:]
         
         return (trimmed_images,)
 
