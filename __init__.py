@@ -24,6 +24,7 @@ NODE_CLASS_MAPPINGS = {
     "Save Image Folder": SaveImageFolder,
     "String To Float List": StringToFloatList,
     "Image Grayscale": ImageGrayscale,
+    "Create Empty Frames": CreateEmptyFrames,
 }
 
 

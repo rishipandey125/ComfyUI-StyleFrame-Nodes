@@ -914,3 +914,32 @@ class ImageGrayscale:
         # Stack the grayscale channel 3 times to create an RGB-like image
         grayscale_image = grayscale_image.unsqueeze(-1).repeat(1, 1, 1, 3)
         return (grayscale_image,)
+
+class CreateEmptyFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 1024, "min": 1, "tooltip": "Frame width in pixels"}),
+                "height": ("INT", {"default": 1024, "min": 1, "tooltip": "Frame height in pixels"}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to generate"}),
+                "empty_frame_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fill level for frames (0.0..1.0)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "create"
+    CATEGORY = "Image Processing"
+    DESCRIPTION = "Generates a batch of N frames filled with the given empty_frame_level (0..1)."
+
+    def create(self, width: int, height: int, num_frames: int, empty_frame_level: float):
+        # Clamp and sanitize inputs
+        w = max(1, int(width))
+        h = max(1, int(height))
+        n = max(1, int(num_frames))
+        lvl = float(max(0.0, min(1.0, empty_frame_level)))
+
+        # Follow SlotFrame convention: create constant frames via ones * empty_frame_level
+        images = torch.ones((n, h, w, 3), dtype=torch.float32) * lvl
+        return (images,)
