@@ -925,21 +925,53 @@ class CreateEmptyFrames:
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 1, "tooltip": "Number of frames to generate"}),
                 "empty_frame_level": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fill level for frames (0.0..1.0)"}),
             },
+            "optional": {
+                "curve": (["(none)", "linear", "ease_in", "ease_out", "ease_in_out"], {"default": "(none)", "tooltip": "Optional easing curve across frames from black→white"})
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
     FUNCTION = "create"
     CATEGORY = "Image Processing"
-    DESCRIPTION = "Generates a batch of N frames filled with the given empty_frame_level (0..1)."
+    DESCRIPTION = "Generates a batch of N frames. If curve='(none)', all frames are filled with empty_frame_level. Otherwise, fill transitions from black→white using the selected easing curve."
 
-    def create(self, width: int, height: int, num_frames: int, empty_frame_level: float):
+    def create(self, width: int, height: int, num_frames: int, empty_frame_level: float, curve="(none)"):
         # Clamp and sanitize inputs
         w = max(1, int(width))
         h = max(1, int(height))
         n = max(1, int(num_frames))
         lvl = float(max(0.0, min(1.0, empty_frame_level)))
 
-        # Follow SlotFrame convention: create constant frames via ones * empty_frame_level
-        images = torch.ones((n, h, w, 3), dtype=torch.float32) * lvl
+        # If no curve selected, create constant frames via ones * empty_frame_level
+        if str(curve).lower() in ["(none)", "none", ""]:
+            images = torch.ones((n, h, w, 3), dtype=torch.float32) * lvl
+            return (images,)
+
+        # Create a normalized timeline t in [0,1] across frames
+        # For n==1, use t=0.0 (black) as start of the transition
+        if n == 1:
+            t = torch.zeros(1, dtype=torch.float32)
+        else:
+            t = torch.linspace(0.0, 1.0, steps=n, dtype=torch.float32)
+
+        curve_key = str(curve).lower().strip()
+        if curve_key == "linear":
+            eased = t
+        elif curve_key in ["ease_in", "easein", "ease-in"]:
+            # cubic ease-in
+            eased = t.pow(3)
+        elif curve_key in ["ease_out", "easeout", "ease-out"]:
+            # cubic ease-out
+            eased = 1.0 - (1.0 - t).pow(3)
+        elif curve_key in ["ease_in_out", "easeinout", "ease-in-out", "ease_inout", "easein-out"]:
+            # cubic ease-in-out
+            eased = torch.where(t < 0.5, 4.0 * t.pow(3), 1.0 - torch.pow(-2.0 * t + 2.0, 3) / 2.0)
+        else:
+            # Fallback to linear if unknown
+            eased = t
+
+        # Broadcast eased levels across spatial and channel dims
+        levels = eased.view(n, 1, 1, 1)
+        images = torch.ones((n, h, w, 3), dtype=torch.float32) * levels
         return (images,)
