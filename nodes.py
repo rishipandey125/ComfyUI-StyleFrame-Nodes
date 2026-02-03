@@ -975,3 +975,83 @@ class CreateEmptyFrames:
         levels = eased.view(n, 1, 1, 1)
         images = torch.ones((n, h, w, 3), dtype=torch.float32) * levels
         return (images,)
+
+
+class SplitRGBChannels:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Input image to split into RGB channels"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("red", "green", "blue")
+    FUNCTION = "split_channels"
+    CATEGORY = "Image Processing/Color"
+    DESCRIPTION = "Splits an image into separate R, G, B channels. Each channel is output as a grayscale image (single channel repeated 3 times) for easy compositing."
+
+    def split_channels(self, image):
+        # image shape: [batch, height, width, channels] where channels=3
+        # Extract each channel
+        red_channel = image[..., 0:1]  # Shape: [B, H, W, 1]
+        green_channel = image[..., 1:2]  # Shape: [B, H, W, 1]
+        blue_channel = image[..., 2:3]  # Shape: [B, H, W, 1]
+        
+        # Repeat each channel 3 times to create RGB images (for compatibility with other nodes)
+        red_image = red_channel.repeat(1, 1, 1, 3)  # Shape: [B, H, W, 3]
+        green_image = green_channel.repeat(1, 1, 1, 3)  # Shape: [B, H, W, 3]
+        blue_image = blue_channel.repeat(1, 1, 1, 3)  # Shape: [B, H, W, 3]
+        
+        return (red_image, green_image, blue_image)
+
+
+class CombineRGBChannels:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "red": ("IMAGE", {"tooltip": "Red channel (grayscale image or single channel)"}),
+                "green": ("IMAGE", {"tooltip": "Green channel (grayscale image or single channel)"}),
+                "blue": ("IMAGE", {"tooltip": "Blue channel (grayscale image or single channel)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "combine_channels"
+    CATEGORY = "Image Processing/Color"
+    DESCRIPTION = "Combines separate R, G, B channel inputs back into a single RGB image. Each input can be a grayscale image (will use first channel) or a full RGB image (will use first channel)."
+
+    def combine_channels(self, red, green, blue):
+        # Handle batch size mismatches - use the minimum batch size
+        batch_sizes = [red.shape[0], green.shape[0], blue.shape[0]]
+        min_batch = min(batch_sizes)
+        
+        # Trim all inputs to the same batch size if needed
+        if red.shape[0] > min_batch:
+            red = red[:min_batch]
+        if green.shape[0] > min_batch:
+            green = green[:min_batch]
+        if blue.shape[0] > min_batch:
+            blue = blue[:min_batch]
+        
+        # Handle size mismatches - resize to match the first input (red)
+        target_h, target_w = red.shape[1], red.shape[2]
+        
+        if green.shape[1] != target_h or green.shape[2] != target_w:
+            green = common_upscale(green.movedim(-1, 1), target_w, target_h, "lanczos", "disabled").movedim(1, -1)
+        
+        if blue.shape[1] != target_h or blue.shape[2] != target_w:
+            blue = common_upscale(blue.movedim(-1, 1), target_w, target_h, "lanczos", "disabled").movedim(1, -1)
+        
+        # Extract first channel from each input (handles both grayscale and RGB inputs)
+        red_channel = red[..., 0:1]  # Shape: [B, H, W, 1]
+        green_channel = green[..., 0:1]  # Shape: [B, H, W, 1]
+        blue_channel = blue[..., 0:1]  # Shape: [B, H, W, 1]
+        
+        # Combine channels into RGB image
+        combined = torch.cat([red_channel, green_channel, blue_channel], dim=-1)  # Shape: [B, H, W, 3]
+        
+        return (combined,)

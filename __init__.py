@@ -25,6 +25,8 @@ NODE_CLASS_MAPPINGS = {
     "String To Float List": StringToFloatList,
     "Image Grayscale": ImageGrayscale,
     "Create Empty Frames": CreateEmptyFrames,
+    "Split RGB Channels": SplitRGBChannels,
+    "Combine RGB Channels": CombineRGBChannels,
 }
 
 
