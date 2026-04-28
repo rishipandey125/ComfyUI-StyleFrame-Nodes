@@ -380,9 +380,10 @@ class ResizeFrame:
             "required": {
                 "frame_width": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame width"}),
                 "frame_height": ("INT", {"default": 4, "min": 1, "tooltip": "Input frame height"}),
-                "target_p": ("INT", {"default": 1080, "min": 16, "tooltip": "Pixel density side: total pixels ≈ target_p^2; preserves AR; multiples of 16"}),
+                "target_p": ("INT", {"default": 1080, "min": 16, "tooltip": "Pixel density side: total pixels ≈ target_p^2; preserves AR"}),
                 "allow_upscale": ("BOOLEAN", {"default": False, "tooltip": "If enabled, allow exceeding original size to hit target pixel density"}),
-                "rounding": ((["nearest", "floor", "ceil"]), {"default": "nearest", "tooltip": "Quantization mode when rounding to multiples of 16"}),
+                "rounding": ((["nearest", "floor", "ceil"]), {"default": "nearest", "tooltip": "Quantization mode when rounding to multiples of step_size"}),
+                "step_size": ("INT", {"default": 64, "min": 1, "max": 128, "step": 1, "tooltip": "Quantize dimensions to multiples of this value (e.g. 64 for LTX 2.3 IC-LoRA, 32 for LTX 2.3, 16 for Wan)"}),
             },
         }
 
@@ -391,66 +392,51 @@ class ResizeFrame:
     FUNCTION = "resize_frame"
     CATEGORY = "Image Processing"
 
-    def resize_frame(self, frame_width, frame_height, target_p, allow_upscale, rounding):
-        # Pixel-density driven sizing:
-        # Given target_p, aim for total pixels ~= target_p^2 while preserving input AR,
-        # and quantize to multiples of 16. Optionally avoid upscaling.
-
-        # Guard invalid inputs
+    def resize_frame(self, frame_width, frame_height, target_p, allow_upscale, rounding, step_size=64):
         fw = int(max(1, frame_width))
         fh = int(max(1, frame_height))
-        tp = int(max(16, target_p))
+        tp = int(max(step_size, target_p))
+        s = int(max(1, step_size))
 
-        # Helper: quantize any value to a multiple of 16 following the selected mode
-        def quantize_to_16(value, mode):
+        def quantize(value, mode):
             v = float(value)
             if mode == "floor":
-                return max(16, (int(v) // 16) * 16)
+                return max(s, (int(v) // s) * s)
             elif mode == "ceil":
-                return max(16, ((int(v) + 15) // 16) * 16)
+                return max(s, ((int(v) + s - 1) // s) * s)
             else:  # nearest
-                lower = (int(v) // 16) * 16
-                upper = lower + 16
-                # ensure lower is at least 16
-                lower = max(16, lower)
+                lower = max(s, (int(v) // s) * s)
+                upper = lower + s
                 if abs(v - lower) <= abs(upper - v):
                     return lower
                 else:
                     return upper
 
-        # Desired area and aspect ratio
         area = float(tp) * float(tp)
-        aspect = float(fw) / float(fh)
-        aspect = max(1e-6, aspect)
+        aspect = max(1e-6, float(fw) / float(fh))
 
-        # Ideal (real-valued) dimensions that satisfy area and AR exactly
-        # w = sqrt(area * aspect), h = area / w
         ideal_w = math.sqrt(area * aspect)
         ideal_h = area / max(1e-6, ideal_w)
 
-        # Respect downscale-only mode by capping to original dimensions prior to quantization
         if not allow_upscale:
             scale_cap = min(1.0, fw / max(1e-6, ideal_w), fh / max(1e-6, ideal_h))
             ideal_w *= scale_cap
             ideal_h *= scale_cap
 
-        q_w = quantize_to_16(ideal_w, rounding)
-        q_h = quantize_to_16(ideal_h, rounding)
+        q_w = quantize(ideal_w, rounding)
+        q_h = quantize(ideal_h, rounding)
 
-        # Ensure we don't exceed original dimensions when upscaling is disabled
         if not allow_upscale:
             if q_w > fw:
-                q_w = (fw // 16) * 16 or 16
+                q_w = (fw // s) * s or s
             if q_h > fh:
-                q_h = (fh // 16) * 16 or 16
-            # If quantization created imbalance vs AR, try to adjust one side closer by one step
+                q_h = (fh // s) * s or s
             if q_w * q_h == 0:
-                q_w = max(16, q_w)
-                q_h = max(16, q_h)
+                q_w = max(s, q_w)
+                q_h = max(s, q_h)
 
-        # Final safety minimums
-        new_width = max(16, int(q_w))
-        new_height = max(16, int(q_h))
+        new_width = max(s, int(q_w))
+        new_height = max(s, int(q_h))
 
         return (new_width, new_height)
 
