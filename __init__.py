@@ -11,7 +11,8 @@ from .nodes import *
 NODE_CLASS_MAPPINGS = {
     "Threshold Image": ThresholdImage,
     "Resize Frame": ResizeFrame,
-    "Pad Batch to 4n+1": PadBatchTo4nPlus1,
+    "Pad Batch to kn+1": PadBatchToNPlus1,
+    "Pad Batch to 4n+1": PadBatchToNPlus1,
     "Trim Padded Batch": TrimPaddedBatch,
     "Get Image Dimensions": GetImageDimensions,
     "Slot Frame": SlotFrame,

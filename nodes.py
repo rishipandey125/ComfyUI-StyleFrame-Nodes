@@ -455,12 +455,13 @@ class ResizeFrame:
         return (new_width, new_height)
 
 
-class PadBatchTo4nPlus1:
+class PadBatchToNPlus1:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE", {"tooltip": "Input images to be padded to 4n+1 size"}),
+                "images": ("IMAGE", {"tooltip": "Input images to be padded to kn+1 frames"}),
+                "interval": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1, "tooltip": "Frame interval k: pads batch to kn+1 (e.g. 4 for Wan, 8 for LTX 2.3)"}),
             },
         }
 
@@ -469,30 +470,20 @@ class PadBatchTo4nPlus1:
     FUNCTION = "pad_batch"
     CATEGORY = "Image Processing"
 
-    def pad_batch(self, images):
-        # Get the current batch size
+    def pad_batch(self, images, interval=8):
         current_size = images.shape[0]
-        
-        # Calculate the next 4n+1 size
-        n = math.ceil((current_size - 1) / 4)
-        target_size = 4 * n + 1
-        
-        # If we're already at a 4n+1 size, return as is
+
+        n = math.ceil((current_size - 1) / interval)
+        target_size = interval * n + 1
+
         if current_size == target_size:
             return (images, current_size, target_size)
-            
-        # Calculate how many frames we need to pad
+
         padding_size = target_size - current_size
-        
-        # Get the last frame to repeat
         last_frame = images[-1]
-        
-        # Create the padding frames by repeating the last frame
         padding_frames = last_frame.unsqueeze(0).repeat(padding_size, 1, 1, 1)
-        
-        # Concatenate the original frames with the padding frames
         padded_images = torch.cat([images, padding_frames], dim=0)
-        
+
         return (padded_images, current_size, target_size)
 
 class TrimPaddedBatch:
