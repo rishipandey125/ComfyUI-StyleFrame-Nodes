@@ -30,6 +30,8 @@ NODE_CLASS_MAPPINGS = {
     "Combine RGB Channels": CombineRGBChannels,
     "LTXVMultiKeyframeGuide": LTXVMultiKeyframeGuide,
     "Crop Guide Frames": CropGuideFrames,
+    "Repeat Frames": RepeatFrames,
+    "Resample Frames": ResampleFrames,
 }
 
 

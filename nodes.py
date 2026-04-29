@@ -1037,6 +1037,59 @@ class CombineRGBChannels:
         return (combined,)
 
 
+class RepeatFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Input image batch to repeat."}),
+                "repeat_factor": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                                          "tooltip": "How many times to repeat each frame (1 = no change)."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("repeated_images", "original_count", "repeat_factor")
+    FUNCTION = "repeat"
+    CATEGORY = "Image Processing"
+    DESCRIPTION = "Repeats each frame N times consecutively to slow down motion for the model. Chain before PadBatchToNPlus1."
+
+    def repeat(self, images, repeat_factor=1):
+        original_count = images.shape[0]
+        if repeat_factor <= 1:
+            return (images, original_count, 1)
+        repeated = images.repeat_interleave(repeat_factor, dim=0)
+        return (repeated, original_count, repeat_factor)
+
+
+class ResampleFrames:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Image batch to resample."}),
+                "step": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                                 "tooltip": "Take every Nth frame (matches repeat_factor used earlier)."}),
+            },
+            "optional": {
+                "offset": ("INT", {"default": 0, "min": 0, "max": 9, "step": 1,
+                                   "tooltip": "Starting offset before stepping."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("resampled_images",)
+    FUNCTION = "resample"
+    CATEGORY = "Image Processing"
+    DESCRIPTION = "Takes every Nth frame from the batch, reversing RepeatFrames. Chain after TrimPaddedBatch."
+
+    def resample(self, images, step=1, offset=0):
+        if step <= 1 and offset == 0:
+            return (images,)
+        resampled = images[offset::step]
+        return (resampled,)
+
+
 class LTXVMultiKeyframeGuide:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1047,8 +1100,14 @@ class LTXVMultiKeyframeGuide:
                 "vae": ("VAE",),
                 "latent": ("LATENT",),
                 "images": ("IMAGE", {"tooltip": "Batch of keyframe images. Count must match the number of frame_indices."}),
-                "frame_indices": ("STRING", {"default": "0, -1", "tooltip": "Comma-separated frame indices for each image (e.g. '0, 27, -1'). Negative values count from the end."}),
+                "frame_indices": ("STRING", {"default": "0, -1", "tooltip": "Comma-separated frame indices in ORIGINAL (pre-repeat) space (e.g. '0, 27, -1'). Negative values count from the end of the original video."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Conditioning strength applied to all keyframes."}),
+            },
+            "optional": {
+                "repeat_factor": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                                          "tooltip": "Frame repeat factor. Indices are auto-scaled and each keyframe is placed repeat_factor times at consecutive positions."}),
+                "original_frame_count": ("INT", {"default": 0, "min": 0,
+                                                  "tooltip": "Original frame count before repeat (used to resolve negative indices). 0 = auto-detect from latent."}),
             },
         }
 
@@ -1056,9 +1115,16 @@ class LTXVMultiKeyframeGuide:
     RETURN_NAMES = ("positive", "negative", "latent")
     FUNCTION = "add_guides"
     CATEGORY = "conditioning/video_models"
-    DESCRIPTION = "Places multiple keyframe images at specified frame indices. Equivalent to chaining multiple LTXVAddGuide nodes."
+    DESCRIPTION = (
+        "Places multiple keyframe images at specified frame indices. Indices are specified "
+        "in original (pre-repeat) frame space. When repeat_factor > 1, each keyframe is "
+        "placed at repeat_factor consecutive positions to match repeated input frames."
+    )
 
-    def add_guides(self, positive, negative, vae, latent, images, frame_indices, strength):
+    def add_guides(self, positive, negative, vae, latent, images, frame_indices, strength,
+                   repeat_factor=1, original_frame_count=0):
+        rf = max(1, repeat_factor)
+
         indices = []
         for token in frame_indices.replace(";", ",").split(","):
             t = token.strip()
@@ -1072,31 +1138,50 @@ class LTXVMultiKeyframeGuide:
         )
 
         scale_factors = vae.downscale_index_formula
+        time_scale_factor = scale_factors[0]
         latent_image = latent["samples"]
         noise_mask = get_noise_mask(latent)
         _, _, latent_length, latent_height, latent_width = latent_image.shape
 
-        for i, f_idx in enumerate(indices):
-            img = images[i:i+1]
+        from comfy_extras.nodes_lt import get_keyframe_idxs
+        _, existing_kf = get_keyframe_idxs(positive)
+        video_latent_count = latent_length - existing_kf
 
+        if original_frame_count > 0:
+            orig_count = original_frame_count
+        else:
+            orig_count = max(1, (video_latent_count - 1) * time_scale_factor + 1) // rf
+
+        resolved = []
+        for idx in indices:
+            if idx < 0:
+                idx = orig_count + idx
+            idx = max(0, idx)
+            resolved.append(idx)
+
+        for i, orig_idx in enumerate(resolved):
+            img = images[i:i+1]
             _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, img, scale_factors)
 
-            frame_idx, latent_idx = LTXVAddGuide.get_latent_index(
-                positive, latent_length, len(img), f_idx, scale_factors
-            )
-            assert latent_idx + t.shape[2] <= latent_length, (
-                f"Keyframe {i} at frame_idx={f_idx} exceeds the latent sequence length."
-            )
+            for r in range(rf):
+                pixel_idx = orig_idx * rf + r
 
-            positive, negative, latent_image, noise_mask = LTXVAddGuide.append_keyframe(
-                positive, negative, frame_idx, latent_image, noise_mask, t, strength, scale_factors,
-            )
+                frame_idx, latent_idx = LTXVAddGuide.get_latent_index(
+                    positive, latent_length, len(img), pixel_idx, scale_factors
+                )
+                assert latent_idx + t.shape[2] <= latent_length, (
+                    f"Keyframe {i} (repeat {r}) at pixel_idx={pixel_idx} exceeds the latent sequence length."
+                )
 
-            pre_filter_count = t.shape[2] * t.shape[3] * t.shape[4]
-            guide_latent_shape = list(t.shape[2:])
-            positive, negative = _append_guide_attention_entry(
-                positive, negative, pre_filter_count, guide_latent_shape, strength=strength,
-            )
+                positive, negative, latent_image, noise_mask = LTXVAddGuide.append_keyframe(
+                    positive, negative, frame_idx, latent_image, noise_mask, t, strength, scale_factors,
+                )
+
+                pre_filter_count = t.shape[2] * t.shape[3] * t.shape[4]
+                guide_latent_shape = list(t.shape[2:])
+                positive, negative = _append_guide_attention_entry(
+                    positive, negative, pre_filter_count, guide_latent_shape, strength=strength,
+                )
 
         return (positive, negative, {"samples": latent_image, "noise_mask": noise_mask})
 
