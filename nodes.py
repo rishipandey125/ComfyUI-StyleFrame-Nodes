@@ -16,6 +16,9 @@ import json
 
 from PIL import Image, ImageOps, ImageSequence
 
+from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask, _append_guide_attention_entry
+import node_helpers as _node_helpers
+
 # Collection of helper nodes for building comfy workflows that power styleframe ai
 
 def convert_tensor_to_numpy(tensor):
@@ -1032,3 +1035,127 @@ class CombineRGBChannels:
         combined = torch.cat([red_channel, green_channel, blue_channel], dim=-1)  # Shape: [B, H, W, 3]
         
         return (combined,)
+
+
+class LTXVMultiKeyframeGuide:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "latent": ("LATENT",),
+                "images": ("IMAGE", {"tooltip": "Batch of keyframe images. Count must match the number of frame_indices."}),
+                "frame_indices": ("STRING", {"default": "0, -1", "tooltip": "Comma-separated frame indices for each image (e.g. '0, 27, -1'). Negative values count from the end."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Conditioning strength applied to all keyframes."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "add_guides"
+    CATEGORY = "conditioning/video_models"
+    DESCRIPTION = "Places multiple keyframe images at specified frame indices. Equivalent to chaining multiple LTXVAddGuide nodes."
+
+    def add_guides(self, positive, negative, vae, latent, images, frame_indices, strength):
+        indices = []
+        for token in frame_indices.replace(";", ",").split(","):
+            t = token.strip()
+            if t == "":
+                continue
+            indices.append(int(t))
+
+        batch_size = images.shape[0]
+        assert len(indices) == batch_size, (
+            f"Number of frame_indices ({len(indices)}) must match image batch size ({batch_size})."
+        )
+
+        scale_factors = vae.downscale_index_formula
+        latent_image = latent["samples"]
+        noise_mask = get_noise_mask(latent)
+        _, _, latent_length, latent_height, latent_width = latent_image.shape
+
+        for i, f_idx in enumerate(indices):
+            img = images[i:i+1]
+
+            _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, img, scale_factors)
+
+            frame_idx, latent_idx = LTXVAddGuide.get_latent_index(
+                positive, latent_length, len(img), f_idx, scale_factors
+            )
+            assert latent_idx + t.shape[2] <= latent_length, (
+                f"Keyframe {i} at frame_idx={f_idx} exceeds the latent sequence length."
+            )
+
+            positive, negative, latent_image, noise_mask = LTXVAddGuide.append_keyframe(
+                positive, negative, frame_idx, latent_image, noise_mask, t, strength, scale_factors,
+            )
+
+            pre_filter_count = t.shape[2] * t.shape[3] * t.shape[4]
+            guide_latent_shape = list(t.shape[2:])
+            positive, negative = _append_guide_attention_entry(
+                positive, negative, pre_filter_count, guide_latent_shape, strength=strength,
+            )
+
+        return (positive, negative, {"samples": latent_image, "noise_mask": noise_mask})
+
+
+class CropGuideFrames:
+    """Crops appended guide frames from a latent back to its original length.
+
+    Unlike LTXVCropGuides (which counts unique temporal positions and
+    under-crops when guides overlap), this node uses the known original
+    pixel frame count to compute the exact target latent length.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+                "original_pixel_frames": ("INT", {
+                    "default": 41,
+                    "min": 1,
+                    "tooltip": "Pixel frame count before any guides were appended (e.g. total_count from PadBatchToNPlus1).",
+                }),
+                "time_scale_factor": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "tooltip": "VAE temporal downscale factor (8 for LTX 2.3).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "crop"
+    CATEGORY = "conditioning/video_models"
+    DESCRIPTION = (
+        "Crops a latent back to its original length after guide frames were appended. "
+        "Drop-in replacement for LTXVCropGuides that handles overlapping guides correctly."
+    )
+
+    def crop(self, positive, negative, latent, original_pixel_frames, time_scale_factor=8):
+        latent_image = latent["samples"].clone()
+        noise_mask = get_noise_mask(latent)
+
+        target_latent_length = ((original_pixel_frames - 1) // time_scale_factor) + 1
+        current_length = latent_image.shape[2]
+
+        if current_length > target_latent_length:
+            latent_image = latent_image[:, :, :target_latent_length]
+            noise_mask = noise_mask[:, :, :target_latent_length]
+
+        positive = _node_helpers.conditioning_set_values(positive, {
+            "keyframe_idxs": None,
+            "guide_attention_entries": None,
+        })
+        negative = _node_helpers.conditioning_set_values(negative, {
+            "keyframe_idxs": None,
+            "guide_attention_entries": None,
+        })
+
+        return (positive, negative, {"samples": latent_image, "noise_mask": noise_mask})

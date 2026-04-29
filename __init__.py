@@ -28,6 +28,8 @@ NODE_CLASS_MAPPINGS = {
     "Create Empty Frames": CreateEmptyFrames,
     "Split RGB Channels": SplitRGBChannels,
     "Combine RGB Channels": CombineRGBChannels,
+    "LTXVMultiKeyframeGuide": LTXVMultiKeyframeGuide,
+    "Crop Guide Frames": CropGuideFrames,
 }
 
 
