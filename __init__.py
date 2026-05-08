@@ -29,6 +29,7 @@ NODE_CLASS_MAPPINGS = {
     "Split RGB Channels": SplitRGBChannels,
     "Combine RGB Channels": CombineRGBChannels,
     "LTXVMultiKeyframeGuide": LTXVMultiKeyframeGuide,
+    "LTXVMultiLatentGuide": LTXVMultiLatentGuide,
     "Crop Guide Frames": CropGuideFrames,
     "Repeat Frames": RepeatFrames,
     "Resample Frames": ResampleFrames,

@@ -1186,6 +1186,151 @@ class LTXVMultiKeyframeGuide:
         return (positive, negative, {"samples": latent_image, "noise_mask": noise_mask})
 
 
+class LTXVMultiLatentGuide:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "latent": ("LATENT",),
+                "guiding_latent": ("LATENT", {"tooltip": "Multi-frame latent where each temporal frame is a separate guide."}),
+                "latent_indices": ("STRING", {"default": "0, -1", "tooltip": "Comma-separated latent indices (e.g. '0, 5, -1'). Negative values count from the end."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Conditioning strength applied to all guides."}),
+            },
+            "optional": {
+                "repeat_factor": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                                          "tooltip": "Latent repeat factor. Indices are auto-scaled and each guide is placed repeat_factor times at consecutive positions."}),
+                "original_latent_count": ("INT", {"default": 0, "min": 0,
+                                                   "tooltip": "Original latent frame count before repeat (used to resolve negative indices). 0 = auto-detect."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "add_guides"
+    CATEGORY = "conditioning/video_models"
+    DESCRIPTION = (
+        "Places multiple latent guides at specified latent indices. Works like LTXVAddLatentGuide "
+        "but accepts multiple guides in one pass. Guides are dilated to match target latent "
+        "spatial dimensions, producing softer 'suggestion' style conditioning."
+    )
+
+    def _dilate(self, samples, noise_mask, vertical_scale, horizontal_scale):
+        """Dilate guide latent to target spatial size with sparse grid placement."""
+        if horizontal_scale == 1 and vertical_scale == 1:
+            return samples, noise_mask
+
+        dilated_shape = samples.shape[:3] + (
+            samples.shape[3] * vertical_scale,
+            samples.shape[4] * horizontal_scale,
+        )
+        dilated_samples = torch.zeros(
+            dilated_shape, device=samples.device, dtype=samples.dtype,
+        )
+        dilated_samples[..., ::vertical_scale, ::horizontal_scale] = samples
+
+        dilated_mask_shape = (
+            dilated_samples.shape[0], 1,
+            dilated_samples.shape[2], dilated_samples.shape[3], dilated_samples.shape[4],
+        )
+        dilated_mask = torch.full(
+            dilated_mask_shape, -1.0, device=samples.device, dtype=samples.dtype,
+        )
+        dilated_mask[..., ::vertical_scale, ::horizontal_scale] = (
+            noise_mask if noise_mask is not None else 1.0
+        )
+        return dilated_samples, dilated_mask
+
+    def add_guides(self, positive, negative, vae, latent, guiding_latent, latent_indices, strength,
+                   repeat_factor=1, original_latent_count=0):
+        rf = max(1, repeat_factor)
+
+        indices = []
+        for token in latent_indices.replace(";", ",").split(","):
+            t = token.strip()
+            if t == "":
+                continue
+            indices.append(int(t))
+
+        guide_samples = guiding_latent["samples"]
+        guide_mask_full = guiding_latent.get("noise_mask", None)
+        num_guides = guide_samples.shape[2]
+
+        assert len(indices) == num_guides, (
+            f"Number of latent_indices ({len(indices)}) must match guiding_latent frame count ({num_guides})."
+        )
+
+        scale_factors = vae.downscale_index_formula
+        time_scale_factor = scale_factors[0]
+        latent_image = latent["samples"]
+        noise_mask = get_noise_mask(latent)
+        _, _, latent_length, latent_height, latent_width = latent_image.shape
+
+        from comfy_extras.nodes_lt import get_keyframe_idxs
+        _, existing_kf = get_keyframe_idxs(positive)
+        video_latent_count = latent_length - existing_kf
+
+        if original_latent_count > 0:
+            orig_count = original_latent_count
+        else:
+            orig_count = video_latent_count // rf
+
+        # Compute spatial dilation scales (same for all guides since they share spatial dims)
+        h_scale = latent_width // guide_samples.shape[4]
+        v_scale = latent_height // guide_samples.shape[3]
+        assert (
+            latent_width % guide_samples.shape[4] == 0
+            and latent_height % guide_samples.shape[3] == 0
+        ), "The ratio of the height and width of the latents and guiding_latent must be an integer."
+
+        # Resolve negative indices
+        resolved = []
+        for idx in indices:
+            if idx < 0:
+                idx = orig_count + idx
+            idx = max(0, idx)
+            resolved.append(idx)
+
+        for i, orig_idx in enumerate(resolved):
+            single_guide = guide_samples[:, :, i:i+1, :, :]
+            single_mask = guide_mask_full[:, :, i:i+1, :, :] if guide_mask_full is not None else None
+
+            guide_orig_shape = list(single_guide.shape[2:])
+
+            dilated_guide, dilated_mask = self._dilate(single_guide, single_mask, v_scale, h_scale)
+
+            iclora_tokens_added = dilated_guide.shape[2] * dilated_guide.shape[3] * dilated_guide.shape[4]
+
+            for r in range(rf):
+                latent_idx = orig_idx * rf + r
+
+                if latent_idx <= 0:
+                    frame_idx = latent_idx * time_scale_factor
+                else:
+                    frame_idx = 1 + (latent_idx - 1) * time_scale_factor
+
+                positive, negative, latent_image, noise_mask = LTXVAddGuide.append_keyframe(
+                    positive=positive,
+                    negative=negative,
+                    frame_idx=frame_idx,
+                    latent_image=latent_image,
+                    noise_mask=noise_mask,
+                    guiding_latent=dilated_guide,
+                    strength=strength,
+                    scale_factors=scale_factors,
+                    guide_mask=dilated_mask,
+                )
+
+                pre_filter_count = iclora_tokens_added
+                positive, negative = _append_guide_attention_entry(
+                    positive, negative, pre_filter_count, guide_orig_shape, strength=strength,
+                )
+
+        return (positive, negative, {"samples": latent_image, "noise_mask": noise_mask})
+
+
 class CropGuideFrames:
     """Crops appended guide frames from a latent back to its original length.
 
