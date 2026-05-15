@@ -254,6 +254,139 @@ class LoadImagesFromList:
         masks_tensor = torch.cat(all_masks, dim=0) if len(all_masks) > 1 else all_masks[0]
         return (images_tensor, masks_tensor)
 
+VIDEO_EXTENSIONS = {"mp4", "mov", "avi", "webm", "mkv", "flv", "wmv", "m4v", "gif"}
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"}
+
+
+class LoadMediaSequence:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "media_files": ("STRING", {
+                    "default": "clip_a.mp4, keyframe.png",
+                    "multiline": True,
+                    "tooltip": "Comma-separated media filenames or absolute paths. Supports images and videos.",
+                }),
+                "start_indices": ("STRING", {
+                    "default": "0, 30",
+                    "multiline": True,
+                    "tooltip": "Comma-separated start indices, one per media file. Videos expand to consecutive indices from the start.",
+                }),
+                "target_width": ("INT", {"default": 768, "min": 1, "tooltip": "Resize all frames to this width (center-crop)."}),
+                "target_height": ("INT", {"default": 512, "min": 1, "tooltip": "Resize all frames to this height (center-crop)."}),
+                "total_frames": ("INT", {"default": 81, "min": 1, "tooltip": "Total video length. Frames at indices >= total_frames are dropped."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT")
+    RETURN_NAMES = ("images", "frame_indices", "frame_count")
+    FUNCTION = "load_sequence"
+    CATEGORY = "Image Processing/IO"
+    DESCRIPTION = (
+        "Loads a mix of images and videos, places them at specified start indices, "
+        "resolves overlapping ranges (later entries overwrite earlier ones), and outputs "
+        "a sorted IMAGE batch + frame_indices string ready for LTXVMultiKeyframeGuide."
+    )
+
+    def _resolve_path(self, name: str) -> str:
+        candidate = os.path.expandvars(os.path.expanduser(name))
+        if os.path.isfile(candidate):
+            return candidate
+        try:
+            return folder_paths.get_annotated_filepath(name)
+        except Exception:
+            input_dir = folder_paths.get_input_directory()
+            return os.path.join(input_dir, name)
+
+    def _resize_center_crop(self, pil_img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+        src_w, src_h = pil_img.size
+        if src_w == 0 or src_h == 0:
+            return pil_img
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = pil_img.resize((new_w, new_h), Image.LANCZOS)
+        left = max(0, (new_w - target_w) // 2)
+        top = max(0, (new_h - target_h) // 2)
+        return resized.crop((left, top, left + target_w, top + target_h))
+
+    def _pil_to_tensor(self, pil_img: Image.Image, target_w: int, target_h: int) -> torch.Tensor:
+        rgb = pil_img.convert("RGB")
+        if rgb.size != (target_w, target_h):
+            rgb = self._resize_center_crop(rgb, target_w, target_h)
+        arr = np.array(rgb).astype(np.float32) / 255.0
+        return torch.from_numpy(arr)
+
+    def _load_image_frames(self, path: str, target_w: int, target_h: int) -> List[torch.Tensor]:
+        img = Image.open(path)
+        frames = []
+        for frame in ImageSequence.Iterator(img):
+            frame = ImageOps.exif_transpose(frame)
+            frames.append(self._pil_to_tensor(frame, target_w, target_h))
+        return frames
+
+    def _load_video_frames(self, path: str, target_w: int, target_h: int) -> List[torch.Tensor]:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {path}")
+        frames = []
+        try:
+            while True:
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb)
+                frames.append(self._pil_to_tensor(pil_img, target_w, target_h))
+        finally:
+            cap.release()
+        return frames
+
+    def _is_video(self, path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        return ext in VIDEO_EXTENSIONS
+
+    def load_sequence(self, media_files: str, start_indices: str,
+                      target_width: int, target_height: int, total_frames: int):
+        files = [f.strip().strip('"').strip("'") for f in media_files.replace("\n", ",").split(",") if f.strip()]
+        idx_tokens = [t.strip() for t in start_indices.replace("\n", ",").split(",") if t.strip()]
+
+        assert len(files) == len(idx_tokens), (
+            f"media_files has {len(files)} entries but start_indices has {len(idx_tokens)}. They must match."
+        )
+
+        starts = [int(t) for t in idx_tokens]
+
+        frame_map: Dict[int, torch.Tensor] = {}
+
+        pbar = ProgressBar(len(files))
+        for entry_idx, (filename, start) in enumerate(zip(files, starts)):
+            path = self._resolve_path(filename)
+
+            if self._is_video(path):
+                entry_frames = self._load_video_frames(path, target_width, target_height)
+            else:
+                entry_frames = self._load_image_frames(path, target_width, target_height)
+
+            for offset, tensor in enumerate(entry_frames):
+                frame_idx = start + offset
+                if 0 <= frame_idx < total_frames:
+                    frame_map[frame_idx] = tensor
+
+            pbar.update(1)
+
+        if len(frame_map) == 0:
+            empty = torch.zeros((1, target_height, target_width, 3), dtype=torch.float32)
+            return (empty, "0", 1)
+
+        sorted_indices = sorted(frame_map.keys())
+        stacked = torch.stack([frame_map[i] for i in sorted_indices], dim=0)
+        indices_str = ", ".join(str(i) for i in sorted_indices)
+
+        return (stacked, indices_str, len(sorted_indices))
+
+
 class LoadImageFolder:
     @classmethod
     def INPUT_TYPES(cls):

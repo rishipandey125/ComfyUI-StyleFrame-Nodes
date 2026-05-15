@@ -22,6 +22,7 @@ NODE_CLASS_MAPPINGS = {
     "Load Image Folder": LoadImageFolder,
     "Load Images": LoadImages,
     "Load Images From List": LoadImagesFromList,
+    "Load Media Sequence": LoadMediaSequence,
     "Save Image Folder": SaveImageFolder,
     "String To Float List": StringToFloatList,
     "Image Grayscale": ImageGrayscale,
